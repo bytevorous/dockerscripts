@@ -10,18 +10,19 @@ Steps, in order:
   5. containers recreate each container from reinit/<n>.sh in manifest "start_order" (databases
                 before apps); containers that were stopped at backup time are created, not started
 
-Anything that already exists is kept, unless you name it:
-  existing container          kept         --overwrite-container NAME   stop + remove, recreate from backup
-  existing volume with data   kept         --overwrite-volume NAME      empty it, refill from backup
-  existing empty volume       filled
-  existing network            used as is
+Anything that already exists on the host is linked as is and NEVER overwritten, unless you name it:
+  existing image / network    linked as is
+  existing volume             linked as is   --overwrite-volume NAME      empty it, refill from backup
+  existing container          linked as is   --overwrite-container NAME   stop + remove, recreate from backup
+  existing bind location      linked as is   (never written to, see below)
 Both flags are repeatable, and named overwrites are always restored (also when not in --only).
-Running containers that use a volume being filled are stopped while it is restored and started
+Running containers that use a volume being overwritten are stopped while it is restored and started
 again afterwards (unless they are themselves being overwritten, then they are recreated).
+Everything linked is shown per item and listed under "Existing on the host" at the end.
 
 Items that are not in the backup (or whose backup failed) are linked to what is on the host now:
 an existing volume / network / container is used as is and never emptied or removed - also when it
-was named with --overwrite-*. These are listed under "Linked to existing" at the end.
+was named with --overwrite-*. These are listed under "Not in the backup" at the end.
 
 Bind mounts are NEVER written to: the restore does not extract binds/ archives and only checks that
 each bind source path exists (read-only). Existing host locations are linked as they are and listed
@@ -169,15 +170,6 @@ def host_dir(docker, name, direct):
     return mp if mp and os.path.isdir(mp) else None
 
 
-def volume_empty(docker, helper, name, direct):
-    """True / False, or None when it cannot be checked."""
-    d = host_dir(docker, name, direct)
-    if d and os.access(d, os.R_OK | os.X_OK):
-        return not os.listdir(d)
-    out = docker("run", "--rm", "-v", f"{name}:/dst:ro", helper, "sh", "-c", "ls -A /dst | head -n 1", check=False)
-    return None if out is None else out.strip() == ""
-
-
 def wipe_volume(docker, helper, name):
     if docker("run", "--rm", "-v", f"{name}:/dst", helper, "sh", "-c",
               "rm -rf /dst/..?* /dst/.[!.]* /dst/*", check=False) is None:
@@ -296,7 +288,8 @@ def main():
         sys.exit(f"ERROR: {mpath} not found - point at a docker-backup-<host>-<time> folder")
     manifest = load_json(mpath)
     log = lambda s: print(s, flush=True)
-    errors, notes, done, kept, linked = [], [], [], [], []
+    errors, notes, done, linked = [], [], [], []
+    existing = {k: [] for k in ("image", "network", "volume", "container", "bind")}
 
     backup, no_inspect = {}, []
     for item in manifest.get("containers", []):
@@ -364,7 +357,8 @@ def main():
             continue
         seen.add(ref)
         if docker("image", "inspect", ref, check=False) is not None:
-            log(f"  {ref:<50} present")
+            existing["image"].append(ref)
+            log(f"  {ref:<50} exists - linked as is (never overwritten)")
             continue
         item = img_items.get(ref) or img_items.get(c["Image"])
         if not item:
@@ -383,7 +377,8 @@ def main():
     log(f"\nNetworks ({len(nets)}):")
     for nn in nets:
         if docker("network", "inspect", nn, check=False) is not None:
-            log(f"  {nn:<30} exists - used as is")
+            existing["network"].append(nn)
+            log(f"  {nn:<30} exists - linked as is (never overwritten)")
             continue
         p = os.path.join(bdir, "networks", safe(nn) + ".json")
         if not os.path.isfile(p):
@@ -419,17 +414,10 @@ def main():
         elif vn in ow_v:
             action = "overwrite"
         else:
-            empty = volume_empty(docker, a.helper, vn, direct)
-            if empty is None:
-                errors.append(f"volume {vn}: exists, but could not check whether it is empty: {last_line(docker.err)}")
-                log(f"  {vn:<30} exists - could not check contents, kept")
-                continue
-            if not empty:
-                kept.append(f"volume {vn}")
-                log(f"  {vn:<30} exists with data - kept (--overwrite-volume {vn} to replace)")
-                continue
-            action = "fill"
-        users = running_users(docker, vn) if action != "create" else []
+            existing["volume"].append(vn)
+            log(f"  {vn:<30} exists - linked as is, never overwritten (--overwrite-volume {vn} to replace)")
+            continue
+        users = running_users(docker, vn) if action == "overwrite" else []
         log(f"  {vn:<30} {action} from {item['file']} ({hb(item.get('bytes'))})"
             + (f"   stopped meanwhile: {', '.join(users)}" if users else ""))
         if a.dry_run:
@@ -455,13 +443,12 @@ def main():
     name_of = {c["Id"]: n for n, c in backup.items()}
     env = dict(os.environ, **({"DOCKER_CONTEXT": a.context} if a.context else {}))
     path_ok = make_path_check(docker, a.helper, direct)
-    bind_links = set()
     for n in order:
         c = backup[n]
         present = docker("container", "inspect", n, check=False) is not None
         if present and n not in ow_c:
-            kept.append(f"container {n}")
-            log(f"  {n:<30} exists - kept (--overwrite-container {n} to replace)")
+            existing["container"].append(n)
+            log(f"  {n:<30} exists - linked as is, never overwritten (--overwrite-container {n} to replace)")
             continue
         binds = sorted({m["Source"] for m in c.get("Mounts") or [] if m.get("Type") == "bind"})
         missing = [b for b in binds if not path_ok(b)]
@@ -481,7 +468,8 @@ def main():
         log(f"  {n:<30} {'overwrite' if present else 'create'}, {'start' if start else 'not started'}  ({source})")
         for b in binds:
             if b not in missing:
-                bind_links.add(b)
+                if b not in existing["bind"]:
+                    existing["bind"].append(b)
                 log(f"      bind {b}  linked to existing location (never overwritten)")
         if missing:
             notes.append(f"container {n}: created although bind sources are missing: {', '.join(missing)}")
@@ -505,20 +493,21 @@ def main():
     if nb:
         notes.append(f"{nb} bind-mount archive(s) in the backup were not restored (see RESTORE.txt)")
 
+    n_existing = sum(len(v) for v in existing.values())
     log("\n" + ("DRY RUN - nothing was changed." if a.dry_run else
-                f"Done: {len(done)} restored, {len(kept)} kept as they were, {len(linked)} linked to existing, "
+                f"Done: {len(done)} restored, {n_existing} existing linked as is, {len(linked)} not in backup, "
                 f"{len(errors)} errors"))
+    if n_existing:
+        log("\nExisting on the host - linked as is, never overwritten:")
+        for kind in ("image", "network", "volume", "container", "bind"):
+            if existing[kind]:
+                log(f"  {kind + 's:':<12}" + ", ".join(existing[kind]))
+        if existing["volume"] or existing["container"]:
+            log("  (replace a volume or container with --overwrite-volume NAME / --overwrite-container NAME)")
     if linked:
-        log("\nLinked to existing (not in the backup - nothing deleted or emptied):")
+        log("\nNot in the backup - linked to what is on the host (nothing deleted or emptied):")
         for x in linked:
             log(f"  {x}")
-    if kept:
-        log("\nKept as they were (exist on host; name with --overwrite-* to replace):")
-        log("  " + ", ".join(kept))
-    if bind_links:
-        log(f"\nBind mounts linked to existing host locations ({len(bind_links)}) - never written to:")
-        for b in sorted(bind_links):
-            log(f"  {b}")
     for x in notes:
         log(f"  note: {x}")
     for e in errors:

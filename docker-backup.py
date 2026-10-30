@@ -161,6 +161,13 @@ def hb(n):
 
 RESTORE = """RESTORE NOTES  ({stamp}, host {host})
 ================================================================================
+Automatic restore (verifies, then images, networks, volumes, containers; anything that already
+exists is kept unless named with --overwrite-container NAME / --overwrite-volume NAME):
+    python3 docker-restore.py /path/to/this/folder --dry-run
+    python3 docker-restore.py /path/to/this/folder
+
+Manual restore, step by step:
+
 Images (only if the backup was made with --images):
     docker load -i images/<file>.tar
 

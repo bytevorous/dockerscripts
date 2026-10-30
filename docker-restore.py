@@ -16,6 +16,8 @@ Anything that already exists on the host is linked as is and NEVER overwritten, 
   existing container          linked as is   --overwrite-container NAME   stop + remove, recreate from backup
   existing bind location      linked as is   (never written to, see below)
 Both flags are repeatable, and named overwrites are always restored (also when not in --only).
+--overwrite-all-containers / --overwrite-all-volumes do the same for everything in scope (all, or
+what --only selects) that is in the backup.
 Running containers that use a volume being overwritten are stopped while it is restored and started
 again afterwards (unless they are themselves being overwritten, then they are recreated).
 Everything linked is shown per item and listed under "Existing on the host" at the end.
@@ -33,11 +35,13 @@ silently create empty root-owned folders in their place; --allow-missing-binds c
   python3 docker-restore.py BACKUP
   python3 docker-restore.py BACKUP --only mariadb --only moodle --no-start
   python3 docker-restore.py BACKUP --overwrite-volume moodle_data --overwrite-container moodle
+  python3 docker-restore.py BACKUP --overwrite-all-volumes --overwrite-all-containers   # full rollback
   ssh user@server 'python3 - /mnt/backups/docker-backup-...' < docker-restore.py
 
 Run as root on the docker host (backup files are 0600). If the backup has no reinit/ folder (made
 through ssh), docker-reinit.py must sit next to this script to rebuild the docker run commands.
-Options: --dry-run  --only NAME  --overwrite-container NAME  --overwrite-volume NAME  --no-start
+Options: --dry-run  --only NAME  --overwrite-container NAME  --overwrite-volume NAME
+         --overwrite-all-containers  --overwrite-all-volumes  --no-start
          --no-verify  --allow-missing-binds  --helper IMAGE  --context NAME
 """
 import argparse, contextlib, functools, hashlib, importlib.util, json, os, re, shutil, subprocess, sys
@@ -270,6 +274,10 @@ def main():
                     help="stop + remove this existing container and recreate it from the backup (repeatable)")
     ap.add_argument("--overwrite-volume", action="append", default=[], metavar="NAME",
                     help="empty this existing volume and refill it from the backup (repeatable)")
+    ap.add_argument("--overwrite-all-containers", action="store_true",
+                    help="overwrite every container in scope that is in the backup")
+    ap.add_argument("--overwrite-all-volumes", action="store_true",
+                    help="overwrite every volume in scope that is in the backup")
     ap.add_argument("--no-start", action="store_true", help="create containers but do not start them")
     ap.add_argument("--no-verify", action="store_true", help="skip the SHA256SUMS check")
     ap.add_argument("--allow-missing-binds", action="store_true",
@@ -314,14 +322,22 @@ def main():
                   | ow_v)
     nets = sorted({k for n in order for k in (backup[n]["NetworkSettings"].get("Networks") or {})
                    if k not in BUILTIN_NETS})
+    if a.overwrite_all_containers:
+        ow_c |= set(order)                  # every in-scope container that is in the backup
+    if a.overwrite_all_volumes:
+        ow_v |= set(vols)                   # volumes not in the backup are still only linked, never emptied
 
     host = (docker("info", "--format", "{{.Name}}", check=False) or "?").strip()
     log(f"Backup:  {bdir}")
     log(f"         made {manifest.get('created')} on host '{manifest.get('host')}'")
     log(f"Target:  docker host '{host}'" + (f" (context {a.context})" if a.context else ""))
     log(f"Scope:   {len(order)} containers, {len(vols)} volumes, {len(nets)} networks")
-    if ow_c or ow_v:
-        log("Overwrite: " + ", ".join([f"container {x}" for x in sorted(ow_c)] + [f"volume {x}" for x in sorted(ow_v)]))
+    ow_desc = ([f"all {len(ow_c)} containers in scope"] if a.overwrite_all_containers
+               else [f"container {x}" for x in sorted(ow_c)])
+    ow_desc += ([f"all {len(ow_v)} volumes in scope"] if a.overwrite_all_volumes
+                else [f"volume {x}" for x in sorted(ow_v)])
+    if ow_desc:
+        log("Overwrite: " + ", ".join(ow_desc) + "   (bind locations are never written to)")
     if a.dry_run:
         log("\nDRY RUN - nothing will be changed.")
     if not_backed:

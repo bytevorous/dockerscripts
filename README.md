@@ -13,6 +13,7 @@ replace a corrupt copy by naming it:
     python3 docker-restore.py BACKUP --dry-run
     python3 docker-restore.py BACKUP
     python3 docker-restore.py BACKUP --overwrite-volume moodle_data --overwrite-container moodle
+    python3 docker-restore.py BACKUP --overwrite-all-volumes --overwrite-all-containers   # full rollback
     python3 docker-restore.py BACKUP --only mariadb --no-start
 
 Both `--overwrite-*` flags are repeatable. Anything not in the backup (or whose backup failed) is linked to
